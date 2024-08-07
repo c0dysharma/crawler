@@ -1,15 +1,17 @@
-import scrapy
 import re
+import scrapy
+from scrapy.spiders import CrawlSpider, Rule
+from scrapy.linkextractors import LinkExtractor
 import json
 from urllib.parse import urlparse
 
 
-class MultiDomainSpider(scrapy.Spider):
+class MultiDomainCrawlSpider(CrawlSpider):
     name = "mdc"
 
     start_urls = [
         'https://en.wikipedia.org/wiki/Vim_(text_editor)',
-        'https://in.ign.com/five-nights-at-freddys/187643/lists/how-to-play-the-five-nights-at-freddys-games-in-chronological-order'
+        'https://in.ign.com/five-nights-at-freddys/187643/lists/how-to-play-the-five-nights-at-freddys-games-in-chronological-order',
     ]
 
     domain_regex = {
@@ -20,41 +22,48 @@ class MultiDomainSpider(scrapy.Spider):
     crawled_links = {}  # will store results
     max_depth = 1  # how much to crawl
 
-    def start_requests(self):
-        for url in self.start_urls:
-            domain = urlparse(url).netloc
-            self.crawled_links[url] = []  # Initialize with an empty list
+    def __init__(self, *args, **kwargs):
+        super(MultiDomainCrawlSpider, self).__init__(*args, **kwargs)
+        self.rules = self.generate_rules()
+        super(MultiDomainCrawlSpider, self)._compile_rules()
 
-            # setting first depth as 0
-            yield scrapy.Request(url, meta={'origin_domain': domain, 'start_url': url, 'depth': 0}, callback=self.parse)
+    def generate_rules(self):
+        rules = []
+        for domain, regex in self.domain_regex.items():
+            rules.append(
+                Rule(
+                    LinkExtractor(allow=regex,
+                                  allow_domains=domain),
+                    callback='parse_page',
+                    follow=True
+                )
+            )
+        return tuple(rules)
 
-    def parse(self, response):
-        origin_domain = response.meta['origin_domain']
-        start_url = response.meta['start_url']
-        current_depth = response.meta['depth']
+    def parse_start_url(self, response):
+        self.crawled_links[response.url] = []
+        return self.parse_page(response)
 
-        # check if the current depth exceeds the maximum depth
-        if current_depth > self.max_depth:
-            return  # stop processing further links
+    def parse_page(self, response):
+        start_url = response.meta.get('start_url', response.url)
+        current_depth = response.meta.get('depth', 0)
 
-        regex_pattern = self.domain_regex.get(origin_domain, None)
-        if not regex_pattern:
-            self.logger.warning(
-                f"No regex pattern found for domain: {origin_domain}")
+        self.crawled_links[start_url].append(response.url)
+
+        if current_depth + 1 > self.max_depth:
             return
 
-        links_found = response.css('a::attr(href)').getall()
-        self.logger.info(f"Found {len(links_found)} links in {response.url}")
-
-        for link in links_found:
+        for link in response.css('a::attr(href)').getall():
             absolute_link = response.urljoin(link)
+            domain = urlparse(absolute_link).netloc
+            if domain in self.domain_regex and re.match(self.domain_regex[domain], absolute_link):
+                absolute_link = response.urljoin(link)
+                yield scrapy.Request(
+                    absolute_link,
+                    meta={'start_url': start_url, 'depth': current_depth + 1},
+                    callback=self.parse_page
+                )
 
-            if re.match(regex_pattern, absolute_link):
-                self.crawled_links[start_url].append(absolute_link)
-                if current_depth + 1 <= self.max_depth:
-                    yield scrapy.Request(absolute_link, meta={'origin_domain': origin_domain, 'start_url': start_url, 'depth': current_depth + 1}, callback=self.parse)
-
-    def closed(self):
+    def closed(self, reason):
         with open('crawled_links.json', 'w') as f:
             json.dump(self.crawled_links, f, indent=4)
-        self.logger.info(f"Crawled links: {self.crawled_links}")
