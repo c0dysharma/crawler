@@ -21,6 +21,7 @@ class MultiDomainCrawlSpider(CrawlSpider):
 
     crawled_links = {}  # will store results
     max_depth = 1  # how much to crawl
+    rules_dict = {}
 
     def __init__(self, *args, **kwargs):
         super(MultiDomainCrawlSpider, self).__init__(*args, **kwargs)
@@ -28,17 +29,35 @@ class MultiDomainCrawlSpider(CrawlSpider):
         super(MultiDomainCrawlSpider, self)._compile_rules()
 
     def generate_rules(self):
-        rules = []
+        rules_dict = {}
         for domain, regex in self.domain_regex.items():
-            rules.append(
+            rules_dict[domain] = (
                 Rule(
-                    LinkExtractor(allow=regex,
-                                  allow_domains=domain),
+                    LinkExtractor(allow=regex),
                     callback='parse_page',
                     follow=True
-                )
+                ),
             )
-        return tuple(rules)
+        self.rules_dict = rules_dict
+        # Flatten the rules into a single tuple for the CrawlSpider
+        return tuple(rule for rules in rules_dict.values() for rule in rules)
+
+    def _requests_to_follow(self, response):
+        if not isinstance(response, scrapy.http.HtmlResponse):
+            return
+        seen = set()
+        domain = urlparse(response.url).netloc
+        rules = self.rules_dict.get(domain, self.rules)
+
+        for rule in rules:
+            links = [l for l in rule.link_extractor.extract_links(
+                response) if l not in seen]
+            if links and rule.process_links:
+                links = rule.process_links(links)
+            for link in links:
+                seen.add(link)
+                r = self._build_request(link, rule)
+                yield rule.process_request(r, response)
 
     def parse_start_url(self, response):
         self.crawled_links[response.url] = []
@@ -55,14 +74,11 @@ class MultiDomainCrawlSpider(CrawlSpider):
 
         for link in response.css('a::attr(href)').getall():
             absolute_link = response.urljoin(link)
-            domain = urlparse(absolute_link).netloc
-            if domain in self.domain_regex and re.match(self.domain_regex[domain], absolute_link):
-                absolute_link = response.urljoin(link)
-                yield scrapy.Request(
-                    absolute_link,
-                    meta={'start_url': start_url, 'depth': current_depth + 1},
-                    callback=self.parse_page
-                )
+            yield scrapy.Request(
+                absolute_link,
+                meta={'start_url': start_url, 'depth': current_depth + 1},
+                callback=self.parse_page,
+            )
 
     def closed(self, reason):
         with open('crawled_links.json', 'w') as f:
